@@ -1,0 +1,10 @@
+{
+  "name": "aqua-ai-uploader",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.616.0",
+    "formidable": "^3.5.0",
+    "sharp": "^0.33.3"
+  }
+}
