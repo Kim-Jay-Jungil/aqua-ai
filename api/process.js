@@ -17,28 +17,27 @@ const ALLOWED = process.env.ALLOWED_ORIGIN || '*';
 const MAX_FILE_MB = Number(process.env.MAX_FILE_MB || '60');
 
 const NOTION_TOKEN = process.env.NOTION_TOKEN || '';
-const NOTION_SUB_DB = process.env.NOTION_SUBMISSIONS_DB_ID || '';
+// 우선 env를 쓰고, 없으면 요청 주신 ID로 fallback
+const NOTION_SUB_DB =
+  process.env.NOTION_SUBMISSIONS_DB_ID || '249bf939a7af80d6a280fa0a6bf68211';
 
-/** ========= 여러분의 Submissions DB 실제 속성명 매핑 =========
- *  (스크린샷 기준) — 이름을 바꾸면 여기만 수정하세요.
- */
+/** ========= 여러분의 Submissions DB 실제 속성명 매핑 ========= */
 const MAP = {
   title: 'Name',                 // Title
   email: 'user_email',           // Email
   models: 'models',              // Multi-select
-  status: 'status',              // Status 또는 Select (둘 다 지원)
-  watermark: 'watermark',        // (있다면) Checkbox 권장
-  originalFiles: 'original_files', // Files & media (external URL로 첨부)
-  originalUrl: 'original_links', // URL (원본 S3/CloudFront 링크)
-  outputUrl: 'output_links',     // URL (결과 S3/CloudFront 링크)
-  createdAt: 'created_at',       // Date(권장) — Date가 아니면 rich_text로 기록
-  completedAt: 'completed_at',   // Checkbox(스크린샷 아이콘상) — Date면 날짜로 기록
+  status: 'status',              // Status 또는 Select
+  watermark: 'watermark',        // Checkbox (있을 때)
+  originalFiles: 'original_files', // Files & media (원본 URL 외부첨부)
+  originalUrl: 'original_links', // URL (원본 S3/CloudFront)
+  outputUrl: 'output_links',     // URL (결과 S3/CloudFront)
+  createdAt: 'created_at',       // Date or Rich text
+  completedAt: 'completed_at',   // Checkbox or Date or Rich text
   consentGallery: 'consent_gallery',   // Checkbox
   consentTraining: 'consent_training', // Checkbox
   notes: 'notes'                 // Rich text (선택)
 };
 
-// Status 값(미리 DB에 만들어 두면 가장 안전)
 const STATUS_DONE = 'Done';
 
 /** ========= S3 (경로형; dot 포함 버킷 호환) ========= */
@@ -56,7 +55,7 @@ const cdnBase = (CDN_BASE_ENV || `https://s3.${REGION}.amazonaws.com/${BUCKET}`)
 /** ========= Notion ========= */
 const notion = (NOTION_TOKEN && NOTION_SUB_DB) ? new NotionClient({ auth: NOTION_TOKEN }) : null;
 
-/** ========= 공통 유틸 ========= */
+/** ========= 유틸 ========= */
 function parseForm(req) {
   return new Promise((resolve, reject) => {
     const form = formidable({ multiples: true, keepExtensions: true, maxFileSize: MAX_FILE_MB * 1024 * 1024 });
@@ -100,12 +99,11 @@ async function applyWatermarkBar(img, label = 'aqua.ai • preview') {
   return img.composite([{ input: Buffer.from(svg), left: 0, top: h - barH }]);
 }
 
-/** ========= DB 속성 메타(타입) 조회 ========= */
+/** ========= DB 속성 타입 조회 ========= */
 async function getDbPropsMeta(dbId) {
   if (!notion || !dbId) return null;
   try {
     const db = await notion.databases.retrieve({ database_id: dbId });
-    // { propName: propType }
     return Object.fromEntries(Object.entries(db.properties || {}).map(([k, v]) => [k, v.type]));
   } catch (e) {
     console.error('[notion] retrieve db failed:', e?.message || e);
@@ -113,7 +111,7 @@ async function getDbPropsMeta(dbId) {
   }
 }
 
-/** ========= Select/Multi-select 옵션 보장(Select만) ========= */
+/** ========= Select/Multi-select 옵션 보장 ========= */
 async function ensureSelectOptionIfNeeded(dbId, propName, valueName) {
   if (!notion || !dbId || !propName || !valueName) return;
   const db = await notion.databases.retrieve({ database_id: dbId });
@@ -129,7 +127,6 @@ async function ensureSelectOptionIfNeeded(dbId, propName, valueName) {
       });
     }
   }
-  // prop.type === 'status' 인 경우는 기본 옵션('To do','In progress','Done')가 있다고 가정
 }
 
 /** ========= 메인 ========= */
@@ -156,7 +153,7 @@ export default async function handler(req, res) {
       res.setHeader('Access-Control-Allow-Origin', ALLOWED);
       return res.status(400).json({ error: 'no file received' });
     }
-    const email = strField(fields.email); // 프런트는 email로 보냄 (DB 속성명은 MAP.email)
+    const email = strField(fields.email);
     const consentGallery = strField(fields.consent_gallery) === '1';
     const consentTraining = strField(fields.consent_training) === '1';
     const models = (() => { try { return JSON.parse(strField(fields.models) || '[]'); } catch { return []; } })();
@@ -176,7 +173,7 @@ export default async function handler(req, res) {
     }));
     const origUrl = `${cdnBase}/${origKey}`;
 
-    // 3) 처리 파이프라인 → JPG
+    // 3) 처리 → JPG
     let img = sharp(f.filepath).rotate().withMetadata();
     if (models.includes('color_restore')) img = img.modulate({ saturation: 1.12 }).linear(1.06, -4);
     if (models.includes('dehaze'))        img = img.sharpen(1.5);
@@ -197,20 +194,20 @@ export default async function handler(req, res) {
     }));
     const outUrl = `${cdnBase}/${outKey}`;
 
-    // 4) Notion 기록 (단일 Submissions DB)
+    // 4) Notion 기록
     if (notion && NOTION_SUB_DB) {
       try {
         const meta = await getDbPropsMeta(NOTION_SUB_DB);
 
-        // Status가 select면 옵션 보장
+        // status가 select면 'Done' 옵션 보장
         if (meta?.[MAP.status] === 'select') {
           await ensureSelectOptionIfNeeded(NOTION_SUB_DB, MAP.status, STATUS_DONE);
         }
-        // models가 multi_select면 옵션 보장(없는 값은 자동 추가)
+        // models가 multi_select면 옵션 자동 추가
         if (meta?.[MAP.models] === 'multi_select' && models.length) {
           const db = await notion.databases.retrieve({ database_id: NOTION_SUB_DB });
-          const existing = new Set((db.properties?.[MAP.models]?.multi_select?.options || []).map(o => o.name));
-          const missing = models.filter(m => m && !existing.has(m));
+          const exist = new Set((db.properties?.[MAP.models]?.multi_select?.options || []).map(o => o.name));
+          const missing = models.filter(m => m && !exist.has(m));
           if (missing.length) {
             const newOptions = [...(db.properties?.[MAP.models]?.multi_select?.options || []), ...missing.map(n => ({ name: n }))];
             await notion.databases.update({
@@ -220,7 +217,6 @@ export default async function handler(req, res) {
           }
         }
 
-        // 각 속성 타입을 보고 맞는 형태로 값 세팅
         const props = {};
 
         if (MAP.title && meta?.[MAP.title] === 'title') {
@@ -240,7 +236,7 @@ export default async function handler(req, res) {
           props[MAP.watermark] = { checkbox: !!wm };
         }
 
-        // 원본 링크/파일
+        // 원본
         if (MAP.originalUrl && meta?.[MAP.originalUrl] === 'url') {
           props[MAP.originalUrl] = { url: origUrl };
         }
@@ -248,7 +244,7 @@ export default async function handler(req, res) {
           props[MAP.originalFiles] = { files: [{ name: `${baseName}${ext}`, external: { url: origUrl } }] };
         }
 
-        // 결과 링크
+        // 결과
         if (MAP.outputUrl && meta?.[MAP.outputUrl] === 'url') {
           props[MAP.outputUrl] = { url: outUrl };
         }
@@ -260,14 +256,15 @@ export default async function handler(req, res) {
         if (MAP.consentTraining && meta?.[MAP.consentTraining] === 'checkbox') {
           props[MAP.consentTraining] = { checkbox: !!consentTraining };
         }
+        const nowIso = new Date().toISOString();
         if (MAP.createdAt && meta?.[MAP.createdAt]) {
-          if (meta[MAP.createdAt] === 'date') props[MAP.createdAt] = { date: { start: new Date().toISOString() } };
-          else if (meta[MAP.createdAt] === 'rich_text') props[MAP.createdAt] = { rich_text: [{ text: { content: new Date().toISOString() } }] };
+          if (meta[MAP.createdAt] === 'date') props[MAP.createdAt] = { date: { start: nowIso } };
+          else if (meta[MAP.createdAt] === 'rich_text') props[MAP.createdAt] = { rich_text: [{ text: { content: nowIso } }] };
         }
         if (MAP.completedAt && meta?.[MAP.completedAt]) {
-          if (meta[MAP.completedAt] === 'date') props[MAP.completedAt] = { date: { start: new Date().toISOString() } };
+          if (meta[MAP.completedAt] === 'date') props[MAP.completedAt] = { date: { start: nowIso } };
           else if (meta[MAP.completedAt] === 'checkbox') props[MAP.completedAt] = { checkbox: true };
-          else if (meta[MAP.completedAt] === 'rich_text') props[MAP.completedAt] = { rich_text: [{ text: { content: new Date().toISOString() } }] };
+          else if (meta[MAP.completedAt] === 'rich_text') props[MAP.completedAt] = { rich_text: [{ text: { content: nowIso } }] };
         }
         if (MAP.notes && meta?.[MAP.notes] === 'rich_text') {
           props[MAP.notes] = { rich_text: [{ text: { content: 'Processed via API v1' } }] };
