@@ -1,8 +1,10 @@
 {
+  "version": 2,
   "functions": {
-    "api/*": {
-      "runtime": "nodejs18.x",
-      "maxDuration": 60
+    "api/**": {
+      "runtime": "nodejs20.x",
+      "maxDuration": 60,
+      "memory": 1024
     }
   }
 }
