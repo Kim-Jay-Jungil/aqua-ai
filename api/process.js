@@ -19,38 +19,29 @@ const MAX_FILE_MB = Number(process.env.MAX_FILE_MB || '60');
 const NOTION_TOKEN = process.env.NOTION_TOKEN || '';
 const NOTION_SUB_DB = process.env.NOTION_SUBMISSIONS_DB_ID || '';
 
-/** ========= Submissions DB 속성 매핑 =========
- *  ⬇️ 여러분의 실제 속성 이름으로 맞추세요.
- *  (없는 속성은 자동으로 건너뜁니다.)
+/** ========= 여러분의 Submissions DB 실제 속성명 매핑 =========
+ *  (스크린샷 기준) — 이름을 바꾸면 여기만 수정하세요.
  */
 const MAP = {
-  SUB: {
-    title: 'Name',               // Title
-    email: 'Email',              // Email
-    models: 'Models',            // Multi-select
-    status: 'Status',            // Select (예: Done / Error)
-    outputUrl: 'OutputURL',      // URL  (결과 이미지)
-    outputKey: 'OutputKey',      // Rich text (선택)
-    outputBytes: 'OutputBytes',  // Number   (선택)
-
-    // 원본 메타
-    originalUrl: 'OriginalURL',  // URL
-    originalKey: 'S3Key',        // Rich text
-    originalSize: 'SizeBytes',   // Number
-    originalMime: 'MimeType',    // Rich text
-    retentionDays: 'RetentionDays', // Number
-    filePreview: 'OriginalFile', // Files & media (선택)
-
-    // 동의/시간
-    consentGallery: 'ConsentGallery',   // Checkbox
-    consentTraining: 'ConsentTraining', // Checkbox
-    createdAt: 'CreatedAt',      // Date
-    completedAt: 'CompletedAt'   // Date
-  },
-  STATUS_OPTIONS: ['Done', 'Error'] // Status 옵션(없으면 자동 추가)
+  title: 'Name',                 // Title
+  email: 'user_email',           // Email
+  models: 'models',              // Multi-select
+  status: 'status',              // Status 또는 Select (둘 다 지원)
+  watermark: 'watermark',        // (있다면) Checkbox 권장
+  originalFiles: 'original_files', // Files & media (external URL로 첨부)
+  originalUrl: 'original_links', // URL (원본 S3/CloudFront 링크)
+  outputUrl: 'output_links',     // URL (결과 S3/CloudFront 링크)
+  createdAt: 'created_at',       // Date(권장) — Date가 아니면 rich_text로 기록
+  completedAt: 'completed_at',   // Checkbox(스크린샷 아이콘상) — Date면 날짜로 기록
+  consentGallery: 'consent_gallery',   // Checkbox
+  consentTraining: 'consent_training', // Checkbox
+  notes: 'notes'                 // Rich text (선택)
 };
 
-/** ========= S3 (경로형) ========= */
+// Status 값(미리 DB에 만들어 두면 가장 안전)
+const STATUS_DONE = 'Done';
+
+/** ========= S3 (경로형; dot 포함 버킷 호환) ========= */
 const s3 = new S3Client({
   region: REGION,
   endpoint: `https://s3.${REGION}.amazonaws.com`,
@@ -63,9 +54,9 @@ const s3 = new S3Client({
 const cdnBase = (CDN_BASE_ENV || `https://s3.${REGION}.amazonaws.com/${BUCKET}`).replace(/\/+$/, '');
 
 /** ========= Notion ========= */
-const notion = (NOTION_TOKEN ? new NotionClient({ auth: NOTION_TOKEN }) : null);
+const notion = (NOTION_TOKEN && NOTION_SUB_DB) ? new NotionClient({ auth: NOTION_TOKEN }) : null;
 
-/** ========= 유틸 ========= */
+/** ========= 공통 유틸 ========= */
 function parseForm(req) {
   return new Promise((resolve, reject) => {
     const form = formidable({ multiples: true, keepExtensions: true, maxFileSize: MAX_FILE_MB * 1024 * 1024 });
@@ -109,43 +100,39 @@ async function applyWatermarkBar(img, label = 'aqua.ai • preview') {
   return img.composite([{ input: Buffer.from(svg), left: 0, top: h - barH }]);
 }
 
-/** ========= Notion: DB 속성 목록 가져오기 & 존재하는 키만 사용 ========= */
-async function getDbPropSet(dbId) {
+/** ========= DB 속성 메타(타입) 조회 ========= */
+async function getDbPropsMeta(dbId) {
   if (!notion || !dbId) return null;
   try {
     const db = await notion.databases.retrieve({ database_id: dbId });
-    return new Set(Object.keys(db.properties || {}));
+    // { propName: propType }
+    return Object.fromEntries(Object.entries(db.properties || {}).map(([k, v]) => [k, v.type]));
   } catch (e) {
     console.error('[notion] retrieve db failed:', e?.message || e);
     return null;
   }
 }
-function filterProps(propsSet, obj) {
-  if (!propsSet) return obj;
-  const out = {};
-  for (const [k, v] of Object.entries(obj)) {
-    if (k && propsSet.has(k)) out[k] = v;
-  }
-  return out;
-}
 
-/** ========= Select/Multi-select 옵션 보장 ========= */
-async function ensureSelectOptions(dbId, propName, names, type /* 'select' | 'multi_select' */) {
-  if (!notion || !dbId || !propName || !Array.isArray(names) || names.length === 0) return;
+/** ========= Select/Multi-select 옵션 보장(Select만) ========= */
+async function ensureSelectOptionIfNeeded(dbId, propName, valueName) {
+  if (!notion || !dbId || !propName || !valueName) return;
   const db = await notion.databases.retrieve({ database_id: dbId });
   const prop = db.properties?.[propName];
-  if (!prop || (prop.type !== type)) return;
-  const existing = new Set((prop[type]?.options || []).map(o => o.name));
-  const missing = names.filter(n => n && !existing.has(n));
-  if (missing.length === 0) return;
-  const newOptions = [...(prop[type]?.options || []), ...missing.map(n => ({ name: n }))];
-  await notion.databases.update({
-    database_id: dbId,
-    properties: { [propName]: { [type]: { options: newOptions } } }
-  });
+  if (!prop) return;
+  if (prop.type === 'select') {
+    const existing = new Set((prop.select?.options || []).map(o => o.name));
+    if (!existing.has(valueName)) {
+      const newOptions = [...(prop.select?.options || []), { name: valueName }];
+      await notion.databases.update({
+        database_id: dbId,
+        properties: { [propName]: { select: { options: newOptions } } }
+      });
+    }
+  }
+  // prop.type === 'status' 인 경우는 기본 옵션('To do','In progress','Done')가 있다고 가정
 }
 
-/** ========= 메인 핸들러 ========= */
+/** ========= 메인 ========= */
 export default async function handler(req, res) {
   // CORS 프리플라이트
   if (req.method === 'OPTIONS') {
@@ -162,14 +149,14 @@ export default async function handler(req, res) {
   }
 
   try {
-    // 1) 폼/입력
+    // 1) 폼 파싱
     const { fields, files } = await parseForm(req);
     const f = pickFirstFile(files);
     if (!f) {
       res.setHeader('Access-Control-Allow-Origin', ALLOWED);
       return res.status(400).json({ error: 'no file received' });
     }
-    const email = strField(fields.email);
+    const email = strField(fields.email); // 프런트는 email로 보냄 (DB 속성명은 MAP.email)
     const consentGallery = strField(fields.consent_gallery) === '1';
     const consentTraining = strField(fields.consent_training) === '1';
     const models = (() => { try { return JSON.parse(strField(fields.models) || '[]'); } catch { return []; } })();
@@ -199,8 +186,8 @@ export default async function handler(req, res) {
       if (meta.width) img = img.resize({ width: Math.round(meta.width * 1.5) });
     }
     if (wm) img = await applyWatermarkBar(img);
-    const out = await img.jpeg({ quality: 92, mozjpeg: true }).toBuffer();
 
+    const out = await img.jpeg({ quality: 92, mozjpeg: true }).toBuffer();
     const outKey = `submissions/${folder}/${Date.now()}-${crypto.randomBytes(3).toString('hex')}/${baseName}_out.jpg`;
     await s3.send(new PutObjectCommand({
       Bucket: BUCKET,
@@ -210,43 +197,82 @@ export default async function handler(req, res) {
     }));
     const outUrl = `${cdnBase}/${outKey}`;
 
-    // 4) Notion 기록 (단일 DB)
+    // 4) Notion 기록 (단일 Submissions DB)
     if (notion && NOTION_SUB_DB) {
       try {
-        // DB 속성 목록을 읽어와서 없는 키는 자동 제거
-        const propSet = await getDbPropSet(NOTION_SUB_DB);
+        const meta = await getDbPropsMeta(NOTION_SUB_DB);
 
-        // Select/Multi-select 옵션 보장
-        if (propSet?.has(MAP.SUB.status)) await ensureSelectOptions(NOTION_SUB_DB, MAP.SUB.status, MAP.STATUS_OPTIONS, 'select');
-        if (propSet?.has(MAP.SUB.models)) await ensureSelectOptions(NOTION_SUB_DB, MAP.SUB.models, models, 'multi_select');
+        // Status가 select면 옵션 보장
+        if (meta?.[MAP.status] === 'select') {
+          await ensureSelectOptionIfNeeded(NOTION_SUB_DB, MAP.status, STATUS_DONE);
+        }
+        // models가 multi_select면 옵션 보장(없는 값은 자동 추가)
+        if (meta?.[MAP.models] === 'multi_select' && models.length) {
+          const db = await notion.databases.retrieve({ database_id: NOTION_SUB_DB });
+          const existing = new Set((db.properties?.[MAP.models]?.multi_select?.options || []).map(o => o.name));
+          const missing = models.filter(m => m && !existing.has(m));
+          if (missing.length) {
+            const newOptions = [...(db.properties?.[MAP.models]?.multi_select?.options || []), ...missing.map(n => ({ name: n }))];
+            await notion.databases.update({
+              database_id: NOTION_SUB_DB,
+              properties: { [MAP.models]: { multi_select: { options: newOptions } } }
+            });
+          }
+        }
 
-        const propsAll = {
-          [MAP.SUB.title]: { title: [{ text: { content: baseName } }] },
-          ...(MAP.SUB.email ? { [MAP.SUB.email]: email ? { email } : { email: null } } : {}),
-          ...(MAP.SUB.models ? { [MAP.SUB.models]: { multi_select: models.map(m => ({ name: m })) } } : {}),
-          ...(MAP.SUB.status ? { [MAP.SUB.status]: { select: { name: MAP.STATUS_OPTIONS[0] } } } : {}), // 'Done'
+        // 각 속성 타입을 보고 맞는 형태로 값 세팅
+        const props = {};
 
-          // 결과
-          ...(MAP.SUB.outputUrl ? { [MAP.SUB.outputUrl]: { url: outUrl } } : {}),
-          ...(MAP.SUB.outputKey ? { [MAP.SUB.outputKey]: { rich_text: [{ text: { content: outKey } }] } } : {}),
-          ...(MAP.SUB.outputBytes ? { [MAP.SUB.outputBytes]: { number: out.length } } : {}),
+        if (MAP.title && meta?.[MAP.title] === 'title') {
+          props[MAP.title] = { title: [{ text: { content: baseName } }] };
+        }
+        if (MAP.email && meta?.[MAP.email] === 'email') {
+          props[MAP.email] = email ? { email } : { email: null };
+        }
+        if (MAP.models && meta?.[MAP.models] === 'multi_select') {
+          props[MAP.models] = { multi_select: models.map(m => ({ name: m })) };
+        }
+        if (MAP.status && meta?.[MAP.status]) {
+          if (meta[MAP.status] === 'select') props[MAP.status] = { select: { name: STATUS_DONE } };
+          else if (meta[MAP.status] === 'status') props[MAP.status] = { status: { name: STATUS_DONE } };
+        }
+        if (MAP.watermark && meta?.[MAP.watermark] === 'checkbox') {
+          props[MAP.watermark] = { checkbox: !!wm };
+        }
 
-          // 원본
-          ...(MAP.SUB.originalUrl ? { [MAP.SUB.originalUrl]: { url: origUrl } } : {}),
-          ...(MAP.SUB.originalKey ? { [MAP.SUB.originalKey]: { rich_text: [{ text: { content: origKey } }] } } : {}),
-          ...(MAP.SUB.originalSize ? { [MAP.SUB.originalSize]: { number: origBuf.length } } : {}),
-          ...(MAP.SUB.originalMime ? { [MAP.SUB.originalMime]: { rich_text: [{ text: { content: f.mimetype || '' } }] } } : {}),
-          ...(MAP.SUB.retentionDays ? { [MAP.SUB.retentionDays]: { number: 30 } } : {}),
-          ...(MAP.SUB.filePreview ? { [MAP.SUB.filePreview]: { files: [{ name: `${baseName}${ext}`, external: { url: origUrl } }] } } : {}),
+        // 원본 링크/파일
+        if (MAP.originalUrl && meta?.[MAP.originalUrl] === 'url') {
+          props[MAP.originalUrl] = { url: origUrl };
+        }
+        if (MAP.originalFiles && meta?.[MAP.originalFiles] === 'files') {
+          props[MAP.originalFiles] = { files: [{ name: `${baseName}${ext}`, external: { url: origUrl } }] };
+        }
 
-          // 동의/시간
-          ...(MAP.SUB.consentGallery ? { [MAP.SUB.consentGallery]: { checkbox: !!consentGallery } } : {}),
-          ...(MAP.SUB.consentTraining ? { [MAP.SUB.consentTraining]: { checkbox: !!consentTraining } } : {}),
-          ...(MAP.SUB.createdAt ? { [MAP.SUB.createdAt]: { date: { start: new Date().toISOString() } } } : {}),
-          ...(MAP.SUB.completedAt ? { [MAP.SUB.completedAt]: { date: { start: new Date().toISOString() } } } : {})
-        };
+        // 결과 링크
+        if (MAP.outputUrl && meta?.[MAP.outputUrl] === 'url') {
+          props[MAP.outputUrl] = { url: outUrl };
+        }
 
-        const props = filterProps(propSet, propsAll);
+        // 동의/시간/메모
+        if (MAP.consentGallery && meta?.[MAP.consentGallery] === 'checkbox') {
+          props[MAP.consentGallery] = { checkbox: !!consentGallery };
+        }
+        if (MAP.consentTraining && meta?.[MAP.consentTraining] === 'checkbox') {
+          props[MAP.consentTraining] = { checkbox: !!consentTraining };
+        }
+        if (MAP.createdAt && meta?.[MAP.createdAt]) {
+          if (meta[MAP.createdAt] === 'date') props[MAP.createdAt] = { date: { start: new Date().toISOString() } };
+          else if (meta[MAP.createdAt] === 'rich_text') props[MAP.createdAt] = { rich_text: [{ text: { content: new Date().toISOString() } }] };
+        }
+        if (MAP.completedAt && meta?.[MAP.completedAt]) {
+          if (meta[MAP.completedAt] === 'date') props[MAP.completedAt] = { date: { start: new Date().toISOString() } };
+          else if (meta[MAP.completedAt] === 'checkbox') props[MAP.completedAt] = { checkbox: true };
+          else if (meta[MAP.completedAt] === 'rich_text') props[MAP.completedAt] = { rich_text: [{ text: { content: new Date().toISOString() } }] };
+        }
+        if (MAP.notes && meta?.[MAP.notes] === 'rich_text') {
+          props[MAP.notes] = { rich_text: [{ text: { content: 'Processed via API v1' } }] };
+        }
+
         await notion.pages.create({ parent: { database_id: NOTION_SUB_DB }, properties: props });
       } catch (e) {
         console.error('[notion] submissions create failed:', e?.message || e);
