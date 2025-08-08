@@ -18,39 +18,36 @@ const MAX_FILE_MB = Number(process.env.MAX_FILE_MB || '60');
 
 const NOTION_TOKEN = process.env.NOTION_TOKEN || '';
 const NOTION_SUB_DB = process.env.NOTION_SUBMISSIONS_DB_ID || '';
-const NOTION_ORIG_DB = process.env.NOTION_ORIGINALS_DB_ID || '';
 
-/** ========= Notion 속성 매핑(여기만 수정하면 됨) =========
- *  ⬇️ 여러분 DB의 실제 속성 이름으로 맞춰 주세요.
- *  제목(Title) 속성도 원하는 이름으로 바꿀 수 있습니다.
+/** ========= Submissions DB 속성 매핑 =========
+ *  ⬇️ 여러분의 실제 속성 이름으로 맞추세요.
+ *  (없는 속성은 자동으로 건너뜁니다.)
  */
 const MAP = {
   SUB: {
     title: 'Name',               // Title
     email: 'Email',              // Email
     models: 'Models',            // Multi-select
-    status: 'Status',            // Select (예: Done/Error 옵션)
-    outputUrl: 'OutputURL',      // URL (결과 S3/CloudFront)
-    originalUrl: 'OriginalURL',  // URL (원본 S3/CloudFront)
+    status: 'Status',            // Select (예: Done / Error)
+    outputUrl: 'OutputURL',      // URL  (결과 이미지)
+    outputKey: 'OutputKey',      // Rich text (선택)
+    outputBytes: 'OutputBytes',  // Number   (선택)
+
+    // 원본 메타
+    originalUrl: 'OriginalURL',  // URL
+    originalKey: 'S3Key',        // Rich text
+    originalSize: 'SizeBytes',   // Number
+    originalMime: 'MimeType',    // Rich text
+    retentionDays: 'RetentionDays', // Number
+    filePreview: 'OriginalFile', // Files & media (선택)
+
+    // 동의/시간
     consentGallery: 'ConsentGallery',   // Checkbox
     consentTraining: 'ConsentTraining', // Checkbox
     createdAt: 'CreatedAt',      // Date
-    completedAt: 'CompletedAt',  // Date
-    relationOriginal: 'Original' // Relation → 대상은 Originals DB
+    completedAt: 'CompletedAt'   // Date
   },
-  ORIG: {
-    title: 'Name',               // Title
-    email: 'Email',              // Email
-    url: 'URL',                  // URL (원본 S3/CloudFront)
-    s3key: 'S3Key',              // Rich text
-    size: 'SizeBytes',           // Number
-    mimetype: 'MimeType',        // Rich text
-    retentionDays: 'RetentionDays',     // Number
-    relationSubmission: 'Submission',   // Relation → 대상은 Submissions DB (선택)
-    filePreview: 'OriginalFile',        // Files & media (선택)
-    createdAt: 'CreatedAt'              // Date (있으면 사용)
-  },
-  STATUS_OPTIONS: ['Done', 'Error']     // Status 셀렉트 옵션 이름(여러분 DB에 미리 있거나, 아래 ensure에서 추가)
+  STATUS_OPTIONS: ['Done', 'Error'] // Status 옵션(없으면 자동 추가)
 };
 
 /** ========= S3 (경로형) ========= */
@@ -112,29 +109,45 @@ async function applyWatermarkBar(img, label = 'aqua.ai • preview') {
   return img.composite([{ input: Buffer.from(svg), left: 0, top: h - barH }]);
 }
 
-/** ========= Notion 보조: 옵션 보장 ========= */
+/** ========= Notion: DB 속성 목록 가져오기 & 존재하는 키만 사용 ========= */
+async function getDbPropSet(dbId) {
+  if (!notion || !dbId) return null;
+  try {
+    const db = await notion.databases.retrieve({ database_id: dbId });
+    return new Set(Object.keys(db.properties || {}));
+  } catch (e) {
+    console.error('[notion] retrieve db failed:', e?.message || e);
+    return null;
+  }
+}
+function filterProps(propsSet, obj) {
+  if (!propsSet) return obj;
+  const out = {};
+  for (const [k, v] of Object.entries(obj)) {
+    if (k && propsSet.has(k)) out[k] = v;
+  }
+  return out;
+}
+
+/** ========= Select/Multi-select 옵션 보장 ========= */
 async function ensureSelectOptions(dbId, propName, names, type /* 'select' | 'multi_select' */) {
   if (!notion || !dbId || !propName || !Array.isArray(names) || names.length === 0) return;
   const db = await notion.databases.retrieve({ database_id: dbId });
   const prop = db.properties?.[propName];
-  if (!prop || (prop.type !== type)) return; // 타입이 다르면 건너뜀
-
+  if (!prop || (prop.type !== type)) return;
   const existing = new Set((prop[type]?.options || []).map(o => o.name));
   const missing = names.filter(n => n && !existing.has(n));
   if (missing.length === 0) return;
-
   const newOptions = [...(prop[type]?.options || []), ...missing.map(n => ({ name: n }))];
   await notion.databases.update({
     database_id: dbId,
-    properties: {
-      [propName]: { [type]: { options: newOptions } }
-    }
+    properties: { [propName]: { [type]: { options: newOptions } } }
   });
 }
 
-/** ========= 메인 ========= */
+/** ========= 메인 핸들러 ========= */
 export default async function handler(req, res) {
-  // CORS
+  // CORS 프리플라이트
   if (req.method === 'OPTIONS') {
     res.setHeader('Access-Control-Allow-Origin', ALLOWED);
     res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
@@ -149,15 +162,13 @@ export default async function handler(req, res) {
   }
 
   try {
-    // 1) 폼 파싱
+    // 1) 폼/입력
     const { fields, files } = await parseForm(req);
     const f = pickFirstFile(files);
     if (!f) {
       res.setHeader('Access-Control-Allow-Origin', ALLOWED);
       return res.status(400).json({ error: 'no file received' });
     }
-
-    // 입력 값
     const email = strField(fields.email);
     const consentGallery = strField(fields.consent_gallery) === '1';
     const consentTraining = strField(fields.consent_training) === '1';
@@ -199,67 +210,44 @@ export default async function handler(req, res) {
     }));
     const outUrl = `${cdnBase}/${outKey}`;
 
-    // 4) Notion 기록
-    let originalPageId = null;
-
-    if (notion && NOTION_ORIG_DB) {
-      try {
-        // Originals 페이지 생성
-        const props = {
-          [MAP.ORIG.title]: { title: [{ text: { content: baseName } }] },
-          ...(MAP.ORIG.email ? { [MAP.ORIG.email]: email ? { email } : { email: null } } : {}),
-          ...(MAP.ORIG.url ? { [MAP.ORIG.url]: { url: origUrl } } : {}),
-          ...(MAP.ORIG.s3key ? { [MAP.ORIG.s3key]: { rich_text: [{ text: { content: origKey } }] } } : {}),
-          ...(MAP.ORIG.size ? { [MAP.ORIG.size]: { number: origBuf.length } } : {}),
-          ...(MAP.ORIG.mimetype ? { [MAP.ORIG.mimetype]: { rich_text: [{ text: { content: f.mimetype || '' } }] } } : {}),
-          ...(MAP.ORIG.createdAt ? { [MAP.ORIG.createdAt]: { date: { start: new Date().toISOString() } } } : {}),
-          ...(MAP.ORIG.retentionDays ? { [MAP.ORIG.retentionDays]: { number: 30 } } : {})
-        };
-        // (선택) 파일 미리보기 필드
-        if (MAP.ORIG.filePreview) {
-          props[MAP.ORIG.filePreview] = { files: [{ name: `${baseName}${ext}`, external: { url: origUrl } }] };
-        }
-        const origPage = await notion.pages.create({ parent: { database_id: NOTION_ORIG_DB }, properties: props });
-        originalPageId = origPage.id;
-      } catch (e) {
-        console.error('[notion] originals create failed:', e?.message || e);
-      }
-    }
-
+    // 4) Notion 기록 (단일 DB)
     if (notion && NOTION_SUB_DB) {
       try {
-        // 상태/모델 옵션 보장(없으면 자동 추가)
-        await ensureSelectOptions(NOTION_SUB_DB, MAP.SUB.status, MAP.STATUS_OPTIONS, 'select');
-        await ensureSelectOptions(NOTION_SUB_DB, MAP.SUB.models, models, 'multi_select');
+        // DB 속성 목록을 읽어와서 없는 키는 자동 제거
+        const propSet = await getDbPropSet(NOTION_SUB_DB);
 
-        // Submissions 페이지 생성
-        const props = {
+        // Select/Multi-select 옵션 보장
+        if (propSet?.has(MAP.SUB.status)) await ensureSelectOptions(NOTION_SUB_DB, MAP.SUB.status, MAP.STATUS_OPTIONS, 'select');
+        if (propSet?.has(MAP.SUB.models)) await ensureSelectOptions(NOTION_SUB_DB, MAP.SUB.models, models, 'multi_select');
+
+        const propsAll = {
           [MAP.SUB.title]: { title: [{ text: { content: baseName } }] },
           ...(MAP.SUB.email ? { [MAP.SUB.email]: email ? { email } : { email: null } } : {}),
           ...(MAP.SUB.models ? { [MAP.SUB.models]: { multi_select: models.map(m => ({ name: m })) } } : {}),
           ...(MAP.SUB.status ? { [MAP.SUB.status]: { select: { name: MAP.STATUS_OPTIONS[0] } } } : {}), // 'Done'
+
+          // 결과
           ...(MAP.SUB.outputUrl ? { [MAP.SUB.outputUrl]: { url: outUrl } } : {}),
+          ...(MAP.SUB.outputKey ? { [MAP.SUB.outputKey]: { rich_text: [{ text: { content: outKey } }] } } : {}),
+          ...(MAP.SUB.outputBytes ? { [MAP.SUB.outputBytes]: { number: out.length } } : {}),
+
+          // 원본
           ...(MAP.SUB.originalUrl ? { [MAP.SUB.originalUrl]: { url: origUrl } } : {}),
+          ...(MAP.SUB.originalKey ? { [MAP.SUB.originalKey]: { rich_text: [{ text: { content: origKey } }] } } : {}),
+          ...(MAP.SUB.originalSize ? { [MAP.SUB.originalSize]: { number: origBuf.length } } : {}),
+          ...(MAP.SUB.originalMime ? { [MAP.SUB.originalMime]: { rich_text: [{ text: { content: f.mimetype || '' } }] } } : {}),
+          ...(MAP.SUB.retentionDays ? { [MAP.SUB.retentionDays]: { number: 30 } } : {}),
+          ...(MAP.SUB.filePreview ? { [MAP.SUB.filePreview]: { files: [{ name: `${baseName}${ext}`, external: { url: origUrl } }] } } : {}),
+
+          // 동의/시간
           ...(MAP.SUB.consentGallery ? { [MAP.SUB.consentGallery]: { checkbox: !!consentGallery } } : {}),
           ...(MAP.SUB.consentTraining ? { [MAP.SUB.consentTraining]: { checkbox: !!consentTraining } } : {}),
           ...(MAP.SUB.createdAt ? { [MAP.SUB.createdAt]: { date: { start: new Date().toISOString() } } } : {}),
-          ...(MAP.SUB.completedAt ? { [MAP.SUB.completedAt]: { date: { start: new Date().toISOString() } } } : {}),
-          ...(MAP.SUB.relationOriginal && originalPageId ? { [MAP.SUB.relationOriginal]: { relation: [{ id: originalPageId }] } } : {})
+          ...(MAP.SUB.completedAt ? { [MAP.SUB.completedAt]: { date: { start: new Date().toISOString() } } } : {})
         };
 
-        const subPage = await notion.pages.create({ parent: { database_id: NOTION_SUB_DB }, properties: props });
-
-        // (선택) Originals 쪽 Relation도 채우고 싶으면
-        if (originalPageId && MAP.ORIG.relationSubmission) {
-          try {
-            await notion.pages.update({
-              page_id: originalPageId,
-              properties: { [MAP.ORIG.relationSubmission]: { relation: [{ id: subPage.id }] } }
-            });
-          } catch (e) {
-            console.error('[notion] originals update relation failed:', e?.message || e);
-          }
-        }
+        const props = filterProps(propSet, propsAll);
+        await notion.pages.create({ parent: { database_id: NOTION_SUB_DB }, properties: props });
       } catch (e) {
         console.error('[notion] submissions create failed:', e?.message || e);
       }
